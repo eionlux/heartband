@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>心率实时监测 - 小米手环</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: rgba(255,255,255,0.04); --border: rgba(255,255,255,0.09);
+    --ink: #e8ecf5; --muted: #8896ac; --accent: #ff3b5c; --accent2: #3b82f6; --good: #22c55e; --warn:#f59e0b;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { -webkit-text-stroke:0; text-shadow:0 1px 3px rgba(0,0,0,0.6); background:var(--bg); color:var(--ink); font-family:'Segoe UI',system-ui,sans-serif; min-height:100vh; display:flex; flex-direction:column; background-image:linear-gradient(rgba(11,16,32,0.45),rgba(11,16,32,0.45)),url('img/cat.png'); background-size:cover; background-position:center; background-attachment:fixed; }
+  header { padding:18px 24px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.12); background:rgba(15,20,40,0.45); backdrop-filter:blur(18px) saturate(140%); -webkit-backdrop-filter:blur(18px) saturate(140%); }
+  header h1 { font-size:18px; font-weight:600; letter-spacing:.3px; }
+  .status { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--muted); }
+  .dot { width:9px; height:9px; border-radius:50%; background:#64748b; }
+  .dot.connected { background:var(--good); box-shadow:0 0 8px var(--good); animation:pulse 1.5s infinite; }
+  .dot.searching { background:var(--warn); animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.4 } }
+  main { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:28px; padding:24px; }
+  #bpmWrap { display:flex; flex-direction:column; align-items:center; gap:6px; }
+  #bpm { font-size:120px; font-weight:700; line-height:1; font-variant-numeric:tabular-nums; letter-spacing:-2px; }
+  #bpmUnit { font-size:20px; color:var(--muted); }
+  #zone { font-size:15px; color:var(--accent); font-weight:500; }
+  .beat { transform-origin:center; }
+  .beat.pump { animation:thump .75s ease; }
+  @keyframes thump { 0%{transform:scale(1)} 12%{transform:scale(1.28)} 100%{transform:scale(1)} }
+  #chartWrap { width:min(760px,94vw); background:rgba(15,20,40,0.5); border:1px solid rgba(255,255,255,0.14); border-radius:16px; padding:16px; backdrop-filter:blur(20px) saturate(150%); -webkit-backdrop-filter:blur(20px) saturate(150%); box-shadow:0 8px 32px rgba(0,0,0,0.35); }
+  canvas { width:100%; height:180px; display:block; }
+  #controls { display:flex; gap:12px; flex-wrap:wrap; justify-content:center; }
+  button { background:var(--accent); color:#fff; border:none; padding:13px 26px; border-radius:12px; font-size:15px; font-weight:600; cursor:pointer; transition:.15s; }
+  button:hover { filter:brightness(1.1); }
+  button.secondary { background:rgba(255,255,255,0.08); color:var(--ink); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  #msg { font-size:13px; color:var(--muted); min-height:18px; text-align:center; }
+  #log { width:min(760px,94vw); max-height:120px; overflow-y:auto; font-size:12px; color:var(--muted); font-family:'Cascadia Mono',Consolas,monospace; background:rgba(10,14,30,0.45); border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:10px; backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); }
+  footer { padding:14px 24px; border-top:1px solid rgba(255,255,255,0.10); color:var(--muted); font-size:12px; text-align:center; background:rgba(15,20,40,0.35); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px); }
+</style>
+</head>
+<body><header>
+  <h1>心率实时监测</h1>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">未连接</span></div>
+</header>
+<main>
+  <div id="bpmWrap">
+    <div id="bpm" class="beat">--</div>
+    <div id="bpmUnit">次 / 分</div>
+    <div id="zone"></div>
+  </div>
+  <div id="chartWrap"><canvas id="chart"></canvas></div>
+  <div id="controls">
+    <button id="connectBtn">连接手环</button>
+    <button id="disconnectBtn" class="secondary" disabled>断开</button>
+  </div>
+  <div id="msg">点击"连接手环"，然后在弹出的系统蓝牙窗口中选择你的小米手环。</div>
+  <div id="log"></div>
+</main>
+<footer>通过 Web Bluetooth 连接手环，订阅心率测量特征实时显示 · 需要在 HTTPS 或 localhost 下运行</footer>
+<script>
+const dot=document.getElementById('dot'), statusText=document.getElementById('statusText');
+const bpmEl=document.getElementById('bpm'), zoneEl=document.getElementById('zone');
+const chart=document.getElementById('chart').getContext('2d');
+const msgEl=document.getElementById('msg'), logEl=document.getElementById('log');
+const connectBtn=document.getElementById('connectBtn'), disconnectBtn=document.getElementById('disconnectBtn');
+
+const HEART_RATE_UUID='0000180d-0000-1000-8000-00805f9b34fb';
+const MEASUREMENT_UUID='00002a37-0000-1000-8000-00805f9b34fb';
+const BODY_SENSOR_UUID='00002a38-0000-1000-8000-00805f9b34fb';
+
+let device=null, hrCharacteristic=null, bleServer=null;
+let history=[];            // {t, bpm}
+let lastBeat=0, connected=false;
+
+function log(txt){ const line='['+new Date().toLocaleTimeString()+'] '+txt; logEl.textContent+=line+'\n'; logEl.scrollTop=logEl.scrollHeight; console.log(txt); }
+function setStatus(state, txt){
+  dot.className='dot'+(state==='connected'?' connected':state==='searching'?' searching':'');
+  statusText.textContent=txt;
+}
+function zoneOf(b){
+  if(b<60)return '心率偏低';
+  if(b<100)return '静息区间';
+  if(b<140)return '有氧区间';
+  if(b<170)return '无氧区间';
+  return '极限区间';
+}
+
+function formatFlags(firstByte){
+  // bit0: 16-bit format if ==1
+  return (firstByte & 0x01) === 0x01 ? 16 : 8;
+}
+function onHeartRate(ev){
+  const dv = ev.target.value;
+  const flags = dv.getUint8(0);
+  const format = formatFlags(flags);
+  let bpm;
+  if(format===16){ bpm = dv.getUint16(1, /*littleEndian*/true); }
+  else { bpm = dv.getUint8(1); }
+  const now = Date.now();
+  history.push({t:now, bpm:bpm});
+  if(history.length>60) history.shift();
+
+  bpmEl.textContent = bpm;
+  bpmEl.classList.remove('pump');
+  void bpmEl.offsetWidth;
+  bpmEl.classList.add('pump');
+  zoneEl.textContent = zoneOf(bpm);
+  drawChart();
+
+  const since = now - lastBeat;
+  if(since>2500){ log('心率 BPM='+bpm+' (间隔 '+(since/1000).toFixed(1)+'s 无通知)'); }
+  lastBeat = now;
+}
+
+async function connect(){
+  if(!navigator.bluetooth){ msg('此浏览器不支持 Web Bluetooth，请用 Edge/Chrome 并确保蓝牙开启'); return; }
+  try{
+    setStatus('searching','搜索手环…');
+    log('请求蓝牙设备…');
+    device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices:false,
+      filters:[{ services:[HEART_RATE_UUID] }],
+      optionalServices:[HEART_RATE_UUID]
+    });
+    log('已选设备: '+(device.name||'无名'));
+    setStatus('searching','连接中…');
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+
+    bleServer = await device.gatt.connect();
+    log('GATT 已连接');
+    setStatus('searching','读取心率服务…');
+    const service = await bleServer.getPrimaryService(HEART_RATE_UUID);
+    hrCharacteristic = await service.getCharacteristic(MEASUREMENT_UUID);
+    await hrCharacteristic.startNotifications();
+    hrCharacteristic.addEventListener('characteristicvaluechanged', onHeartRate);
+    connected = true;
+    setStatus('connected','已连接：'+(device.name||'手环'));
+    msgEl.textContent='已连接，正在实时接收心率。若有波动但始终为固定值，说明手环开启了"非实时"的心率模式或用 App 端锁定了心率。';
+    connectBtn.disabled=true; disconnectBtn.disabled=false;
+    log('心率测量 Notify 已订阅，等待数据…');
+  }catch(err){
+    setStatus('searching','连接失败');
+    log('错误: '+err.message);
+    msgEl.innerHTML='<span style="color:#f87171">连接失败：'+esc(err.message)+'</span>';
+    if(err.name==='SecurityError'){ msgEl.innerHTML='<span style="color:#fbbf24">需要 HTTPS 或 localhost 才能使用蓝牙。<b>请通过本页提供的 localhost 地址访问，不要用 file:// 直接打开。</b></span>'; }
+  }
+}
+function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+function onDisconnected(){
+  connected=false;
+  setStatus('searching','连接已断开');
+  msgEl.textContent='手环已断开，点"连接手环"重新连接。';
+  connectBtn.disabled=false; disconnectBtn.disabled=true;
+  log('GATT 连接断开');
+  if(histId){ clearTimeout(histId); }
+}
+async function disconnect(){
+  try{
+    if(hrCharacteristic){ await hrCharacteristic.stopNotifications().catch(()=>{}); }
+    if(device && device.gatt.connected){ device.gatt.disconnect(); }
+  }catch(e){ log('断开出错: '+e.message); }
+  onDisconnected();
+}
+function drawChart(){
+  chart.clearRect(0,0,chart.canvas.width,chart.canvas.height);
+  const W=chart.canvas.width, H=chart.canvas.height;
+  // baseline & grid
+  chart.strokeStyle='rgba(255,255,255,0.06)';
+  chart.lineWidth=1;
+  for(let i=0;i<=4;i++){ const y=H-((i/4)*H); chart.beginPath(); chart.moveTo(0,y); chart.lineTo(W,y); chart.stroke(); }
+  // accent gradient area + line
+  if(history.length<2)return;
+  const tg=(t)=>W - (Date.now()-t)/4000 * W;   // 4s window -> width
+  const min=maxSampleHistory();
+  chart.beginPath();
+  // area
+  let first=true;
+  for(const p of history){ const x=tg(p.t); const y=H-( (p.bpm-40)/(120) )*H; if(first){chart.moveTo(x,y);first=false;} else {chart.lineTo(x,y);} }
+  chart.strokeStyle='#ff3b5c'; chart.lineWidth=2; chart.shadowColor='#ff3b5c'; chart.shadowBlur=8; chart.stroke();
+  chart.shadowBlur=0;
+  // dots
+  chart.fillStyle='#ff5580';
+  for(const p of history){ const x=tg(p.t); const y=H-( (p.bpm-40)/(120) )*H; chart.beginPath(); chart.arc(x,y,2.2,0,Math.PI*2); chart.fill(); }
+  // current value label
+  const last=history[history.length-1];
+  const lx=tg(last.t), ly=H-( (last.bpm-40)/(120) )*H;
+  chart.fillStyle='#ff3b5c'; chart.font='bold 12px Segoe UI,sans-serif'; chart.fillText(last.bpm+' bpm', lx-28, ly-8);
+}
+function maxSampleHistory(){ let m=0; for(const p of history){ if(p.bpm>m)m=p.bpm; } return m; }
+function setupCanvas(){
+  const canvas=document.getElementById('chart');
+  const dpr=window.devicePixelRatio||1;
+  const rect=canvas.parentElement.getBoundingClientRect();
+  canvas.width=rect.width*dpr; canvas.height=180*dpr;
+  chart.setTransform(dpr,0,0,dpr,0,0);
+  chart.canvas.style.width=rect.width+'px'; chart.canvas.style.height='180px';
+  drawChart();
+}
+let histId=null;
+setInterval(()=>{ drawChart(); }, 1000);
+connectBtn.addEventListener('click', connect);
+disconnectBtn.addEventListener('click', disconnect);
+window.addEventListener('resize', setupCanvas);
+window.addEventListener('blur', ()=>{ histId=null; });
+setupCanvas();
+log('页面就绪。请确保手环已充电并与本机蓝牙可发现。');
+log('Web Bluetooth 支持的状态: '+(navigator.bluetooth?'可用':'不可用'));
+</script>
+</body>
+</html>
